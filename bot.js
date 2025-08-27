@@ -1,11 +1,12 @@
 // CS Suomi — CS2 patch notes bot (Finnish from counter-strike.net)
-// Posts as plain text (so #channels/emojis/@roles work).
+// Posts plain text; splits for 2000-char limit; robust link extraction + logging.
 //
 // Env vars (Render):
-//   BOT_TOKEN  -> Discord bot token
-//   CHANNEL_ID -> target channel ID
+//   BOT_TOKEN              -> Discord bot token
+//   CHANNEL_ID             -> target channel ID
+//   FORCE_POST_ON_BOOT     -> "true" to force-post latest once on startup (optional)
 //
-// package.json must have:
+// package.json:
 // {
 //   "type": "module",
 //   "scripts": { "start": "node bot.js" },
@@ -17,16 +18,17 @@ import fetch from "node-fetch";
 // ---- CONFIG ----
 const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const CUSTOM_EMOJI = "<:cssuomi:1410389173512310955>"; // your emoji
+const FORCE_POST_ON_BOOT = (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() === "true";
+const CUSTOM_EMOJI = "<:cssuomi:1410389173512310955>";
 const POLL_MS = 5 * 60 * 1000;
 
 const LIST_URL = "https://www.counter-strike.net/news/updates?l=finnish";
 const BASE = "https://www.counter-strike.net";
 
-// Keep last posted URL (in-memory; may repost once after restart)
+// keep last posted URL (in-memory)
 let lastUrl = null;
 
-// ---- BASIC POST ----
+// ---- Discord post ----
 async function post(content) {
   const res = await fetch(`https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`, {
     method: "POST",
@@ -42,54 +44,53 @@ async function post(content) {
   }
 }
 
-// ---- HELPERS ----
+// ---- Helpers ----
 
-// Very light HTML → text converter tailored for CS update pages
+// Convert HTML from the update page to readable Discord text
 function htmlToText(html) {
-  let s = html;
+  let s = html.replace(/\r/g, "");
 
-  // Normalize line endings
-  s = s.replace(/\r/g, "");
-
-  // Convert <br> and <li> to line breaks
+  // Breaks
   s = s.replace(/<\s*br\s*\/?>/gi, "\n");
+
+  // LI -> bullets
   s = s.replace(/<\s*li[^>]*>/gi, "• ");
   s = s.replace(/<\/\s*li\s*>/gi, "\n");
 
-  // Headings: <h1>, <h2>, <h3> -> bracketed uppercase section titles
+  // Headings -> [UPPERCASE]
   s = s.replace(/<\s*h[1-3][^>]*>([\s\S]*?)<\/\s*h[1-3]\s*>/gi, (_, t) => {
-    const clean = t.replace(/<[^>]+>/g, "").trim().toUpperCase();
-    return clean ? `\n[${clean}]\n` : "\n";
+    const clean = (t || "").replace(/<[^>]+>/g, "").trim().toUpperCase();
+    return clean ? `\n[ ${clean} ]\n` : "\n";
   });
 
-  // Paragraphs -> ensure newline separation
+  // Paragraphs
   s = s.replace(/<\s*p[^>]*>/gi, "\n");
   s = s.replace(/<\/\s*p\s*>/gi, "\n");
 
-  // Bold/italic basic conversions
+  // Bold/italic
   s = s.replace(/<\s*strong[^>]*>([\s\S]*?)<\/\s*strong\s*>/gi, "**$1**");
   s = s.replace(/<\s*b[^>]*>([\s\S]*?)<\/\s*b\s*>/gi, "**$1**");
   s = s.replace(/<\s*i[^>]*>([\s\S]*?)<\/\s*i\s*>/gi, "*$1*");
   s = s.replace(/<\s*em[^>]*>([\s\S]*?)<\/\s*em\s*>/gi, "*$1*");
 
-  // Links: keep link text only
+  // Links: keep text only
   s = s.replace(/<\s*a [^>]*>([\s\S]*?)<\/\s*a\s*>/gi, "$1");
 
-  // Strip images/scripts/styles completely
+  // Strip images/scripts/styles
   s = s.replace(/<\s*img[^>]*>/gi, "");
   s = s.replace(/<\s*script[\s\S]*?<\/\s*script\s*>/gi, "");
   s = s.replace(/<\s*style[\s\S]*?<\/\s*style\s*>/gi, "");
 
-  // Remove all other HTML tags
+  // Remove other tags
   s = s.replace(/<[^>]+>/g, "");
 
-  // Collapse 3+ newlines to 2
+  // Collapse triple+ newlines
   s = s.replace(/\n{3,}/g, "\n\n");
 
   return s.trim();
 }
 
-// Split long text into Discord-safe chunks with header as first line
+// First message includes header, then chunk body across multiple messages if needed
 function chunksWithHeader(headerLine, body) {
   const LIMIT = 2000;
   const header = `${headerLine}\n\n`;
@@ -109,92 +110,104 @@ function chunksWithHeader(headerLine, body) {
   return chunks;
 }
 
-// Fetch the latest update page URL from the updates listing
+// Fetch listing page and extract latest update URL (robust)
 async function fetchLatestUpdateUrl() {
-  const r = await fetch(LIST_URL, { headers: { "User-Agent": "cs-suomi-bot/1.0" } });
+  const r = await fetch(LIST_URL, { headers: { "User-Agent": "cs-suomi-bot/1.1" } });
   if (!r.ok) throw new Error("List request failed: " + r.status);
   const html = await r.text();
 
-  // Find the first link to a specific update page
-  // Typical hrefs look like /news/updates/<slug>?l=finnish or /news/updates/<slug>
-  const m = html.match(/href="(\/news\/updates\/[^"]+)"/i);
-  if (!m) return null;
+  // Grab all hrefs that look like /news/updates/<slug> (with ' or " quotes)
+  const links = [];
+  const re = /href\s*=\s*['"]([^'"]*\/news\/updates\/[^'"]+)['"]/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    let href = m[1];
 
-  // Ensure we keep Finnish param
-  const href = m[1].includes("?") ? m[1] : `${m[1]}?l=finnish`;
-  return BASE + href;
+    // Ensure finnish param
+    if (!/[?&]l=finnish\b/i.test(href)) {
+      href += (href.includes("?") ? "&" : "?") + "l=finnish";
+    }
+    // Build absolute URL if needed
+    const url = href.startsWith("http") ? href : BASE + href;
+
+    links.push(url);
+  }
+
+  console.log("Found update links:", links.slice(0, 5)); // log a few candidates
+
+  // Return the first candidate (the page usually lists newest first)
+  return links.length ? links[0] : null;
 }
 
-// Fetch the update page and extract the main content
+// Fetch the update page and extract main patch notes content
 async function fetchUpdateBodyText(updateUrl) {
-  const r = await fetch(updateUrl, { headers: { "User-Agent": "cs-suomi-bot/1.0" } });
+  const r = await fetch(updateUrl, { headers: { "User-Agent": "cs-suomi-bot/1.1" } });
   if (!r.ok) throw new Error("Update request failed: " + r.status);
   const html = await r.text();
 
-  // Try to locate the primary content container
-  // We fall back to whole body if we can't isolate easily.
-  let content = "";
-
-  // Heuristic: grab inside <body> first
+  // Prefer a known patch container; fall back to body content
   const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
   const bodyHtml = bodyMatch ? bodyMatch[1] : html;
 
-  // If page has a known wrapper (Valve changes this sometimes), try a few common sections:
-  // 1) class="patchnotes" …  2) id="patchnotes" … 3) generic article divs
   const candidates = [
     /<div[^>]+class="[^"]*patchnotes[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
     /<div[^>]+id="patchnotes"[^>]*>([\s\S]*?)<\/div>/i,
     /<article[^>]*>([\s\S]*?)<\/article>/i
   ];
 
+  let content = "";
   for (const re of candidates) {
     const mm = bodyHtml.match(re);
-    if (mm && mm[1]) {
-      content = mm[1];
-      break;
-    }
+    if (mm && mm[1]) { content = mm[1]; break; }
   }
+  if (!content) content = bodyHtml;
 
-  if (!content) {
-    // Fallback: use the whole body HTML
-    content = bodyHtml;
-  }
-
-  return htmlToText(content);
+  const text = htmlToText(content);
+  console.log(`Fetched update text length: ${text.length}`);
+  return text;
 }
 
-// ---- POLL LOOP ----
-async function poll() {
+// ---- Poll loop ----
+async function processOnce(reason = "poll") {
   try {
+    console.log(`[${reason}] Fetching latest URL…`);
     const url = await fetchLatestUpdateUrl();
+    console.log("Latest URL:", url);
+
     if (!url) return;
 
-    if (url !== lastUrl) {
-      // New update detected
+    const isNew = (url !== lastUrl);
+    if (isNew || FORCE_POST_ON_BOOT) {
+      console.log(`New or forced post. lastUrl=${lastUrl} next=${url}`);
       const text = await fetchUpdateBodyText(url);
+      if (!text || text.trim().length < 10) {
+        console.warn("Update text seems empty/short; skipping post.");
+        lastUrl = url; // avoid spinning on a bad page
+        return;
+      }
 
-      // Build and send messages
       const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
       const out = chunksWithHeader(header, text);
       for (const msg of out) await post(msg);
 
       lastUrl = url;
       console.log("Posted update from:", url);
+    } else {
+      console.log("No new update.");
     }
   } catch (e) {
-    console.error("Poll error:", e);
+    console.error("Process error:", e);
   }
 }
 
-// ---- STARTUP ----
+async function poll() { await processOnce("poll"); }
+
+// ---- Startup ----
 if (!TOKEN || !CHANNEL_ID) {
-  console.error("Missing BOT_TOKEN or CHANNEL_ID env vars");
+  console.error("Missing BOT_TOKEN or CHANNEL_ID");
   process.exit(1);
 }
 
-// Simple boot message so you know it's alive
-await post(`${CUSTOM_EMOJI}  CS Suomi bot on käynnissä ✅ (lähde: counter-strike.net/updates FI)`);
-
-// Run once, then poll periodically
-await poll();
+await post(`${CUSTOM_EMOJI}  CS Suomi bot on käynnissä ✅ (FI source: counter-strike.net)`);
+await processOnce("startup");
 setInterval(poll, POLL_MS);
