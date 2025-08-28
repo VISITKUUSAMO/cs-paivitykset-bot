@@ -1,10 +1,12 @@
-// CS Suomi — CS2 patch notes bot (Finnish via official blog RSS)
-// Posts plain text; splits for 2000-char; robust logging.
+// CS Suomi — CS2 patch notes bot (Finnish from counter-strike.net)
+// - Source: https://www.counter-strike.net/news/updates?l=finnish
+// - Finds newest /news/updates/... link, fetches page, converts HTML -> Discord text
+// - Posts header + body, then the updates page link at the end with embeds SUPPRESSED
 //
 // Env vars (Render):
 //   BOT_TOKEN              -> Discord bot token
 //   CHANNEL_ID             -> target channel ID
-//   FORCE_POST_ON_BOOT     -> "true" to force-post latest once on startup (optional)
+//   FORCE_POST_ON_BOOT     -> "true" to force-post the latest once after deploy (optional)
 //
 // package.json:
 // {
@@ -23,21 +25,22 @@ const FORCE_POST_ON_BOOT = (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() 
 const CUSTOM_EMOJI = "<:cssuomi:1410389173512310955>";
 const POLL_MS = 5 * 60 * 1000;
 
-// Official Counter-Strike blog RSS (Finnish)
-const RSS_URL = "https://blog.counter-strike.net/index.php/feed/?l=finnish";
+const LIST_URL_FI = "https://www.counter-strike.net/news/updates?l=finnish";
+const BASE = "https://www.counter-strike.net";
 
-// keep last posted link (in-memory)
-let lastLink = null;
+// keep last posted update URL (in-memory)
+let lastUrl = null;
 
-// ---- Discord post ----
-async function post(content) {
+// ---- Discord helpers ----
+async function post(content, { suppressEmbeds = false } = {}) {
+  const payload = suppressEmbeds ? { content, flags: 4 } : { content }; // flags:4 = SUPPRESS_EMBEDS
   const res = await fetch(`https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`, {
     method: "POST",
     headers: {
       Authorization: `Bot ${TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -45,41 +48,28 @@ async function post(content) {
   }
 }
 
-// ---- Helpers ----
-
-// Super-light XML extractors (good enough for RSS)
-function firstMatch(re, text) {
-  const m = re.exec(text);
-  return m ? m[1] : null;
-}
-
-function findAll(re, text) {
-  const out = [];
-  let m;
-  while ((m = re.exec(text)) !== null) out.push(m[1]);
-  return out;
-}
-
-// Clean HTML from RSS content into Discord-friendly text
+// ---- HTML -> text ----
 function htmlToText(html) {
   let s = (html || "").replace(/\r/g, "");
 
-  // Line breaks and list items
+  // <br> -> newline
   s = s.replace(/<\s*br\s*\/?>/gi, "\n");
-  s = s.replace(/<\s*li[^>]*>/gi, "• ");
+
+  // <li> items -> asterisk bullets (your preference)
+  s = s.replace(/<\s*li[^>]*>/gi, "* ");
   s = s.replace(/<\/\s*li\s*>/gi, "\n");
 
-  // Headings -> [UPPERCASE]
+  // Headings -> [ UPPERCASE ] (keep bracketed look)
   s = s.replace(/<\s*h[1-3][^>]*>([\s\S]*?)<\/\s*h[1-3]\s*>/gi, (_, t) => {
     const clean = (t || "").replace(/<[^>]+>/g, "").trim().toUpperCase();
     return clean ? `\n[ ${clean} ]\n` : "\n";
   });
 
-  // Paragraphs
+  // Paragraphs -> separate with newlines
   s = s.replace(/<\s*p[^>]*>/gi, "\n");
   s = s.replace(/<\/\s*p\s*>/gi, "\n");
 
-  // Bold/italic
+  // Basic text formatting
   s = s.replace(/<\s*strong[^>]*>([\s\S]*?)<\/\s*strong\s*>/gi, "**$1**");
   s = s.replace(/<\s*b[^>]*>([\s\S]*?)<\/\s*b\s*>/gi, "**$1**");
   s = s.replace(/<\s*i[^>]*>([\s\S]*?)<\/\s*i\s*>/gi, "*$1*");
@@ -88,21 +78,19 @@ function htmlToText(html) {
   // Links: keep text only
   s = s.replace(/<\s*a [^>]*>([\s\S]*?)<\/\s*a\s*>/gi, "$1");
 
-  // Strip images/scripts/styles
+  // Strip images/scripts/styles/other tags
   s = s.replace(/<\s*img[^>]*>/gi, "");
   s = s.replace(/<\s*script[\s\S]*?<\/\s*script\s*>/gi, "");
   s = s.replace(/<\s*style[\s\S]*?<\/\s*style\s*>/gi, "");
-
-  // Remove other tags
   s = s.replace(/<[^>]+>/g, "");
 
-  // Collapse triple+ newlines
+  // Collapse multiple blank lines
   s = s.replace(/\n{3,}/g, "\n\n");
 
   return s.trim();
 }
 
-// First message includes header, then chunk body if needed
+// Split for Discord limit; first chunk gets header
 function chunksWithHeader(headerLine, body) {
   const LIMIT = 2000;
   const header = `${headerLine}\n\n`;
@@ -122,69 +110,91 @@ function chunksWithHeader(headerLine, body) {
   return chunks;
 }
 
-// Fetch and parse the RSS feed, return the latest "updates" item
-async function fetchLatestRssItem() {
-  const r = await fetch(RSS_URL, { headers: { "User-Agent": "cs-suomi-bot/2.0" } });
-  if (!r.ok) throw new Error("RSS request failed: " + r.status);
-  const xml = await r.text();
-
-  // Split items
-  const itemBlocks = findAll(/<item>([\s\S]*?)<\/item>/gi, xml);
-  console.log(`RSS items found: ${itemBlocks.length}`);
-
-  // Choose the first item whose link looks like an update (safer),
-  // otherwise just take the very first item.
-  let chosen = null;
-  for (const it of itemBlocks) {
-    const link = firstMatch(/<link>([\s\S]*?)<\/link>/i, it) || "";
-    if (/\/updates\//i.test(link) || /updates/i.test(it)) {
-      chosen = it;
-      break;
-    }
-  }
-  if (!chosen && itemBlocks.length) chosen = itemBlocks[0];
-  if (!chosen) return null;
-
-  const link = firstMatch(/<link>([\s\S]*?)<\/link>/i, chosen)?.trim() || null;
-  const title = firstMatch(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>|<title>([\s\S]*?)<\/title>/i, chosen) || "CS Päivitys";
-
-  // Prefer <content:encoded>, else <description>
-  const encoded = firstMatch(/<content:encoded><!\[CDATA\[([\s\S]*?)\]\]><\/content:encoded>/i, chosen);
-  const desc = firstMatch(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>|<description>([\s\S]*?)<\/description>/i, chosen);
-  const html = encoded || desc || "";
-
-  const text = htmlToText(html);
-  console.log("Chosen title:", (Array.isArray(title) ? title.find(Boolean) : title), " | link:", link, " | textLen:", text.length);
-
-  return { link, title: Array.isArray(title) ? title.find(Boolean) : title, text };
+// ---- Fetch helpers ----
+async function fetchText(url) {
+  const r = await fetch(url, { headers: { "User-Agent": "cs-suomi-bot/3.0" } });
+  if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
+  return await r.text();
 }
 
+// Extract newest /news/updates/... URL from the Finnish updates listing
+function extractLatestUpdateUrl(listHtml) {
+  const links = [];
+  const re = /href\s*=\s*['"]([^'"]*\/news\/updates\/[^'"]+)['"]/gi;
+  let m;
+  while ((m = re.exec(listHtml)) !== null) {
+    let href = m[1];
+    // guarantee Finnish param
+    if (!/[?&]l=finnish\b/i.test(href)) {
+      href += (href.includes("?") ? "&" : "?") + "l=finnish";
+    }
+    const full = href.startsWith("http") ? href : BASE + href;
+    links.push(full);
+  }
+  // Page usually lists newest first; take the first valid link
+  return links.length ? links[0] : null;
+}
+
+// Pull main content from the update page (fall back to body if needed)
+function extractContentHtml(updateHtml) {
+  const bodyMatch = updateHtml.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  const bodyHtml = bodyMatch ? bodyMatch[1] : updateHtml;
+
+  const candidates = [
+    /<div[^>]+class="[^"]*patchnotes[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+    /<div[^>]+id="patchnotes"[^>]*>([\s\S]*?)<\/div>/i,
+    /<article[^>]*>([\s\S]*?)<\/article>/i,
+  ];
+  for (const re of candidates) {
+    const mm = bodyHtml.match(re);
+    if (mm && mm[1]) return mm[1];
+  }
+  return bodyHtml;
+}
+
+// ---- Core cycle ----
 async function processOnce(reason = "poll") {
   try {
-    console.log(`[${reason}] Fetching RSS…`);
-    const item = await fetchLatestRssItem();
-    if (!item) {
-      console.log("No RSS item parsed.");
-      return;
-    }
+    console.log(`[${reason}] Fetching updates list…`);
+    const listHtml = await fetchText(LIST_URL_FI);
 
-    const isNew = (item.link && item.link !== lastLink);
+    const latestUrl = extractLatestUpdateUrl(listHtml);
+    console.log("Latest updates URL:", latestUrl);
+
+    if (!latestUrl) return;
+
+    const isNew = latestUrl !== lastUrl;
     if (isNew || FORCE_POST_ON_BOOT) {
-      const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
-      const out = chunksWithHeader(header, item.text);
-      for (const msg of out) await post(msg);
+      console.log("New or forced. Fetching update page…");
+      const updateHtml = await fetchText(latestUrl);
+      const contentHtml = extractContentHtml(updateHtml);
+      const text = htmlToText(contentHtml);
+      console.log("Extracted text length:", text.length);
 
-      lastLink = item.link || lastLink; // avoid reposts
-      console.log("Posted update from RSS link:", item.link || "(no link)");
+      if (!text || text.trim().length < 10) {
+        console.warn("Update text empty/short; skipping post.");
+        lastUrl = latestUrl;
+        return;
+      }
+
+      // 1) Post header + body (split)
+      const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
+      const parts = chunksWithHeader(header, text);
+      for (const p of parts) await post(p);
+
+      // 2) Post the source link at the end, with embeds suppressed
+      //    (so it shows the link text only, no preview)
+      await post(latestUrl, { suppressEmbeds: true });
+
+      lastUrl = latestUrl;
+      console.log("Posted update from:", latestUrl);
     } else {
-      console.log("No new update (same link).");
+      console.log("No new update.");
     }
   } catch (e) {
     console.error("Process error:", e);
   }
 }
-
-async function poll() { await processOnce("poll"); }
 
 // ---- Startup ----
 if (!TOKEN || !CHANNEL_ID) {
@@ -192,8 +202,6 @@ if (!TOKEN || !CHANNEL_ID) {
   process.exit(1);
 }
 
-await post(`${CUSTOM_EMOJI}  CS Suomi bot on käynnissä ✅ (lähde: blog.counter-strike.net FI RSS)`);
-
-// Force one post on boot if requested
+await post(`${CUSTOM_EMOJI}  CS Suomi bot on käynnissä ✅ (lähde: counter-strike.net/updates FI)`);
 await processOnce("startup");
-setInterval(poll, POLL_MS);
+setInterval(() => processOnce("poll"), POLL_MS);
