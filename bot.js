@@ -1,6 +1,6 @@
 // CS Suomi — CS2 patch notes bot
 // Posts latest CS2 patch notes in English from Steam News API.
-// Avoids duplicate posts by persisting last GID to last_gid.txt.
+// Avoids duplicate posts by persisting last posted URL (stable vs gid).
 //
 // Env vars:
 //   BOT_TOKEN  -> Discord bot token
@@ -26,17 +26,17 @@ const POLL_MS = 5 * 60 * 1000; // every 5 minutes
 const FEED_URL =
   "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=730&count=1&maxlength=0&l=english";
 
-// File to persist last GID
-const STATE_FILE = "last_gid.txt";
+// File to persist last posted URL
+const STATE_FILE = "last_url.txt";
 
-// Last posted gid (loaded from file if exists)
-let lastGid = null;
+// Last posted URL (loaded from file if exists)
+let lastUrl = null;
 if (fs.existsSync(STATE_FILE)) {
   try {
-    lastGid = fs.readFileSync(STATE_FILE, "utf8").trim() || null;
-    console.log("Loaded lastGid from file:", lastGid);
+    lastUrl = fs.readFileSync(STATE_FILE, "utf8").trim() || null;
+    console.log("Loaded lastUrl from file:", lastUrl);
   } catch (e) {
-    console.warn("Could not read last_gid.txt:", e);
+    console.warn("Could not read last_url.txt:", e);
   }
 }
 
@@ -119,7 +119,7 @@ function chunksWithHeader(headerLine, body) {
 
 // ---- Fetch latest news item ----
 async function fetchLatestNews() {
-  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.2" } });
+  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.3" } });
   if (!r.ok) throw new Error(`Feed request failed: ${r.status}`);
   const j = await r.json();
   return j?.appnews?.newsitems?.[0] || null;
@@ -134,17 +134,22 @@ async function poll() {
       return;
     }
 
-    if (item.gid === lastGid) {
-      console.log("No new update (same gid).");
+    if (!item.url) {
+      console.log("No URL in item, skipping.");
+      return;
+    }
+
+    if (item.url === lastUrl) {
+      console.log("No new update (same URL).");
       return;
     }
 
     // Mark as posted *before* sending messages
-    lastGid = item.gid;
+    lastUrl = item.url;
     try {
-      fs.writeFileSync(STATE_FILE, lastGid, "utf8");
+      fs.writeFileSync(STATE_FILE, lastUrl, "utf8");
     } catch (e) {
-      console.warn("Could not write last_gid.txt:", e);
+      console.warn("Could not write last_url.txt:", e);
     }
 
     const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
@@ -157,11 +162,9 @@ async function poll() {
     }
 
     // Always add source link (suppress embed with <...>)
-    if (item.url) {
-      await post(`<${item.url}>`);
-    }
+    await post(`<${item.url}>`);
 
-    console.log("Posted update:", item.title || item.gid);
+    console.log("Posted update:", item.title || item.url);
   } catch (e) {
     console.error("Poll error:", e);
   }
