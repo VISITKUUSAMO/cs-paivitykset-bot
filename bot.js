@@ -1,6 +1,6 @@
-// CS Suomi — CS2 patch notes bot (Finnish via Steam Store News RSS)
-// Filters for counter-strike.net/news/updates/... links only.
-// Posts plain text; adds link at the end with preview suppressed.
+// CS Suomi — CS2 patch notes bot
+// Posts English body (from Steam Store News RSS) + links (source + Finnish updates page).
+// No startup message; embeds suppressed for links; gentle filtering to prefer patch notes.
 //
 // Env vars (Render):
 //   BOT_TOKEN              -> Discord bot token
@@ -19,28 +19,34 @@ import fetch from "node-fetch";
 // ---- CONFIG ----
 const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const FORCE_POST_ON_BOOT = (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() === "true";
+const FORCE_POST_ON_BOOT =
+  (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() === "true";
 
 const CUSTOM_EMOJI = "<:cssuomi:1410389173512310955>";
-const POLL_MS = 5 * 60 * 1000;
+const POLL_MS = 5 * 60 * 1000; // 5 min
 
-// Steam Store News RSS (Finnish) for app 730 (CS2)
-const RSS_URL = "https://store.steampowered.com/feeds/news/?appids=730&l=finnish";
+// Steam Store News RSS for app 730 (CS2). `l=finnish` mainly localizes UI on the Steam site.
+const RSS_URL =
+  "https://store.steampowered.com/feeds/news/?appids=730&l=finnish";
 
-// Keep last posted link (in-memory; may repost once after restart)
+// Keep last posted link (in-memory)
 let lastLink = null;
 
 // ---- Discord helpers ----
 async function post(content, { suppressEmbeds = false } = {}) {
+  if (!content) return;
   const payload = suppressEmbeds ? { content, flags: 4 } : { content }; // 4 = SUPPRESS_EMBEDS
-  const res = await fetch(`https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bot ${TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  const res = await fetch(
+    `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     console.error("Post failed:", res.status, txt);
@@ -59,7 +65,7 @@ function findAll(re, text) {
   return out;
 }
 
-// ---- HTML -> text (Finnish formatting as requested) ----
+// ---- HTML -> text ----
 function htmlToText(html) {
   let s = (html || "").replace(/\r/g, "");
 
@@ -119,62 +125,82 @@ function chunksWithHeader(headerLine, body) {
   return chunks;
 }
 
-// ---- Core: fetch & filter the RSS feed ----
+// ---- Patch-notes heuristics ----
+function looksLikePatchNotes(title, link) {
+  const t = (title || "").toLowerCase();
+  const l = (link || "").toLowerCase();
+  return (
+    /update|release notes|patch|client update/i.test(t) ||
+    /\/news\/updates\//.test(l) || // counter-strike.net
+    /store\.steampowered\.com\/news\/app\/730\/view\//.test(l) // Steam News for CS2
+  );
+}
+
+// ---- Core: fetch & pick the latest likely patch-notes item ----
 async function fetchLatestUpdateItem() {
-  const r = await fetch(RSS_URL, { headers: { "User-Agent": "cs-suomi-bot/3.1" } });
+  const r = await fetch(RSS_URL, { headers: { "User-Agent": "cs-suomi-bot/3.3" } });
   if (!r.ok) throw new Error("RSS request failed: " + r.status);
   const xml = await r.text();
 
-  // RSS uses <item> blocks; pick the first whose <link> matches counter-strike.net/news/updates/
   const itemBlocks = findAll(/<item>([\s\S]*?)<\/item>/gi, xml);
   console.log(`RSS items found: ${itemBlocks.length}`);
 
-  let chosen = null;
-  let chosenLink = null;
+  let best = null;
+  let bestLink = null;
+  let bestTitle = null;
 
   for (const it of itemBlocks) {
-    const link = firstMatch(/<link>([\s\S]*?)<\/link>/i, it);
-    if (link && /counter-strike\.net\/news\/updates\//i.test(link)) {
-      chosen = it;
-      chosenLink = link.trim();
+    const link =
+      firstMatch(/<link><!\[CDATA\[([\s\S]*?)\]\]><\/link>/i, it) ||
+      firstMatch(/<link>([\s\S]*?)<\/link>/i, it);
+    const title =
+      firstMatch(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i, it) ||
+      firstMatch(/<title>([\s\S]*?)<\/title>/i, it) ||
+      "";
+
+    if (looksLikePatchNotes(title, link)) {
+      best = it;
+      bestLink = (link || "").trim();
+      bestTitle = title.trim();
       break;
     }
   }
 
-  // Fallback: if none matched (Valve sometimes varies), take the first item but we’ll still post its link
-  if (!chosen && itemBlocks.length) {
-    chosen = itemBlocks[0];
-    chosenLink = firstMatch(/<link>([\s\S]*?)<\/link>/i, chosen)?.trim() || null;
+  // Fallback: take newest if none matched heuristics
+  if (!best && itemBlocks.length) {
+    best = itemBlocks[0];
+    bestLink =
+      (firstMatch(/<link><!\[CDATA\[([\s\S]*?)\]\]><\/link>/i, best) ||
+        firstMatch(/<link>([\s\S]*?)<\/link>/i, best) ||
+        "").trim();
+    bestTitle =
+      firstMatch(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i, best) ||
+      firstMatch(/<title>([\s\S]*?)<\/title>/i, best) ||
+      "CS Update";
   }
 
-  if (!chosen) return null;
+  if (!best) return null;
 
-  // Title & content (prefer content:encoded, else description)
-  const title =
-    firstMatch(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i, chosen) ||
-    firstMatch(/<title>([\s\S]*?)<\/title>/i, chosen) ||
-    "CS Päivitys";
-
-  const encoded = firstMatch(/<content:encoded><!\[CDATA\[([\s\S]*?)\]\]><\/content:encoded>/i, chosen);
+  // Body: prefer <content:encoded>, else <description>
+  const encoded = firstMatch(
+    /<content:encoded><!\[CDATA\[([\s\S]*?)\]\]><\/content:encoded>/i,
+    best
+  );
   const desc =
-    firstMatch(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/i, chosen) ||
-    firstMatch(/<description>([\s\S]*?)<\/description>/i, chosen);
+    firstMatch(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/i, best) ||
+    firstMatch(/<description>([\s\S]*?)<\/description>/i, best);
 
   const html = encoded || desc || "";
   const text = htmlToText(html);
 
-  console.log("Chosen link:", chosenLink);
-  console.log("Title:", title);
-  console.log("Text length:", text.length);
+  // Source link we discovered from RSS
+  const sourceLink = bestLink;
 
-  // Make sure posted link is the Finnish updates listing if the link isn't an updates page
-  let postLink = chosenLink || "https://www.counter-strike.net/news/updates?l=finnish";
-  if (/counter-strike\.net\/news\/updates\//i.test(postLink) && !/[?&]l=finnish\b/i.test(postLink)) {
-    // ensure Finnish query (not always needed, but safe)
-    postLink += (postLink.includes("?") ? "&" : "?") + "l=finnish";
-  }
+  // A Finnish landing page to share as well
+  const finnishUpdatesLanding =
+    "https://www.counter-strike.net/news/updates?l=finnish";
 
-  return { title, text, postLink };
+  return { title: bestTitle, text, sourceLink, finnishUpdatesLanding };
 }
 
 async function processOnce(reason = "poll") {
@@ -186,18 +212,22 @@ async function processOnce(reason = "poll") {
       return;
     }
 
-    const isNew = item.postLink && item.postLink !== lastLink;
+    const isNew = item.sourceLink && item.sourceLink !== lastLink;
     if (isNew || FORCE_POST_ON_BOOT) {
-      // Build & send body
       const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
-      const parts = chunksWithHeader(header, item.text);
+
+      // English body, Finnish header
+      const parts = chunksWithHeader(header, item.text || "Patch notes available at the links below.");
       for (const p of parts) await post(p);
 
-      // Send the source link at the end, preview suppressed
-      await post(item.postLink, { suppressEmbeds: true });
+      // 1) Original source link (embed suppressed)
+      if (item.sourceLink) await post(item.sourceLink, { suppressEmbeds: true });
 
-      lastLink = item.postLink || lastLink;
-      console.log("Posted update from:", item.postLink);
+      // 2) Finnish updates landing (embed suppressed)
+      await post(item.finnishUpdatesLanding, { suppressEmbeds: true });
+
+      lastLink = item.sourceLink || lastLink;
+      console.log("Posted update from:", item.sourceLink);
     } else {
       console.log("No new update (same link).");
     }
@@ -206,7 +236,9 @@ async function processOnce(reason = "poll") {
   }
 }
 
-async function poll() { await processOnce("poll"); }
+async function poll() {
+  await processOnce("poll");
+}
 
 // ---- Startup ----
 if (!TOKEN || !CHANNEL_ID) {
@@ -214,6 +246,6 @@ if (!TOKEN || !CHANNEL_ID) {
   process.exit(1);
 }
 
-await post(`${CUSTOM_EMOJI}  CS Suomi bot on käynnissä ✅ (lähde: Steam Store News RSS FI, updates only)`);
+// No startup announcement
 await processOnce("startup");
 setInterval(poll, POLL_MS);
