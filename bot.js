@@ -1,31 +1,35 @@
 // CS Suomi — CS2 patch notes bot
-// Source: official Counter-Strike.net Atom feed
-// Posts English text body + source link + Finnish landing link
-// Handles Discord rate limits, no startup announcement
+// English only, plain text output with Discord markdown.
+// Env vars:
+//   BOT_TOKEN  -> Discord bot token
+//   CHANNEL_ID -> target channel ID
+//
+// package.json:
+// {
+//   "type": "module",
+//   "scripts": { "start": "node bot.js" },
+//   "dependencies": { "node-fetch": "^3.3.2" }
+// }
 
 import fetch from "node-fetch";
 
 // ---- CONFIG ----
 const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const FORCE_POST_ON_BOOT =
-  (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() === "true";
-
 const CUSTOM_EMOJI = "<:cssuomi:1410389173512310955>";
-const POLL_MS = 5 * 60 * 1000; // poll every 5 minutes
+const POLL_MS = 5 * 60 * 1000; // every 5 min
 
-// Atom feed for CS2 news
-const ATOM_URL = "https://www.counter-strike.net/news/atom";
+// Steam CS2 news feed (app 730)
+const FEED_URL =
+  "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=730&count=1&maxlength=0&l=english";
 
-// In-memory last posted link
-let lastLink = null;
+let lastGid = null;
 
-// ---- Discord post helpers ----
+// ---- Discord post helper ----
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function post(content, { suppressEmbeds = false } = {}) {
+async function post(content) {
   if (!content) return;
-  const payload = suppressEmbeds ? { content, flags: 4 } : { content };
   while (true) {
     const res = await fetch(
       `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`,
@@ -35,7 +39,7 @@ async function post(content, { suppressEmbeds = false } = {}) {
           Authorization: `Bot ${TOKEN}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ content }),
       }
     );
     if (res.ok) return;
@@ -52,62 +56,40 @@ async function post(content, { suppressEmbeds = false } = {}) {
   }
 }
 
-// ---- XML helpers ----
-function firstMatch(re, text) {
-  const m = re.exec(text);
-  return m ? m[1] : null;
-}
-function findAll(re, text) {
-  const out = [];
-  let m;
-  while ((m = re.exec(text)) !== null) out.push(m[1]);
-  return out;
-}
+// ---- Text cleanup ----
+function transformSteamToDiscord(raw) {
+  let s = (raw || "").replace(/\r/g, "");
 
-// Decode HTML entities
-function htmlDecode(s = "") {
-  return s
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
+  // Remove [img] tags
+  s = s.replace(/\[img\][\s\S]*?\[\/img\]/gi, "");
 
-// Convert Atom <content> HTML to Discord-friendly text
-function htmlToText(htmlRaw) {
-  let html = htmlDecode(htmlRaw || "");
-  let s = html.replace(/\r/g, "");
+  // [url=...]text[/url] → text
+  s = s.replace(/\[url=.*?\]([\s\S]*?)\[\/url\]/gi, "$1");
 
-  s = s.replace(/<\s*br\s*\/?>/gi, "\n");
-  s = s.replace(/<\s*li[^>]*>/gi, "* ");
-  s = s.replace(/<\/\s*li\s*>/gi, "\n");
+  // Bold/italic/underline
+  s = s.replace(/\[b\]([\s\S]*?)\[\/b\]/gi, "**$1**");
+  s = s.replace(/\[i\]([\s\S]*?)\[\/i\]/gi, "*$1*");
+  s = s.replace(/\[u\]([\s\S]*?)\[\/u\]/gi, "__$1__");
 
-  s = s.replace(/<\s*h[1-3][^>]*>([\s\S]*?)<\/\s*h[1-3]\s*>/gi, (_, t) => {
-    const clean = (t || "").replace(/<[^>]+>/g, "").trim().toUpperCase();
-    return clean ? `\n[ ${clean} ]\n` : "\n";
-  });
+  // Lists
+  s = s.replace(/\[\*\]\s*/gi, "• ");
+  s = s.replace(/\[\/?list\]/gi, "");
 
-  s = s.replace(/<\s*p[^>]*>/gi, "\n");
-  s = s.replace(/<\/\s*p\s*>/gi, "\n");
+  // Strip other BBCode but keep inner text
+  s = s.replace(/\[([a-z0-9]+)(?:=[^\]]+)?\]([\s\S]*?)\[\/\1\]/gi, "$2");
 
-  s = s.replace(/<\s*strong[^>]*>([\s\S]*?)<\/\s*strong\s*>/gi, "**$1**");
-  s = s.replace(/<\s*b[^>]*>([\s\S]*?)<\/\s*b\s*>/gi, "**$1**");
-  s = s.replace(/<\s*i[^>]*>([\s\S]*?)<\/\s*i\s*>/gi, "*$1*");
-
-  s = s.replace(/<\s*a [^>]*>([\s\S]*?)<\/\s*a\s*>/gi, "$1");
-
-  s = s.replace(/<[^>]+>/g, "");
+  // Collapse blank lines
   s = s.replace(/\n{3,}/g, "\n\n");
 
   return s.trim();
 }
 
-// Split into Discord-safe chunks
+// Split into safe chunks
 function chunksWithHeader(headerLine, body) {
   const LIMIT = 2000;
   const header = `${headerLine}\n\n`;
   const chunks = [];
+
   if ((header + body).length <= LIMIT) {
     chunks.push(header + body);
   } else {
@@ -120,65 +102,46 @@ function chunksWithHeader(headerLine, body) {
   return chunks;
 }
 
-// ---- Fetch Atom feed & pick latest update ----
-async function fetchLatestUpdate() {
-  const r = await fetch(ATOM_URL, { headers: { "User-Agent": "cs-suomi-bot/1.0" } });
-  if (!r.ok) throw new Error("Atom request failed: " + r.status);
-  const xml = await r.text();
-
-  const entries = findAll(/<entry>([\s\S]*?)<\/entry>/gi, xml);
-  if (!entries.length) return null;
-
-  for (const e of entries) {
-    const link = firstMatch(/<link[^>]+href="([^"]+)"/i, e) || "";
-    if (!/\/updates\//i.test(link)) continue; // only updates posts
-
-    const title = firstMatch(/<title[^>]*>([\s\S]*?)<\/title>/i, e)?.trim() || "CS2 Update";
-    const content = firstMatch(/<content[^>]*>([\s\S]*?)<\/content>/i, e) || "";
-    const text = htmlToText(content);
-
-    return {
-      title,
-      text,
-      sourceLink: link,
-      finnishLanding: "https://www.counter-strike.net/news/updates?l=finnish",
-    };
-  }
-
-  return null;
+// ---- Fetch latest news item ----
+async function fetchLatestNews() {
+  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.0" } });
+  if (!r.ok) throw new Error(`Feed request failed: ${r.status}`);
+  const j = await r.json();
+  return j?.appnews?.newsitems?.[0] || null;
 }
 
-// ---- Main processing ----
-async function processOnce(reason = "poll") {
-  console.log(`[${reason}] Fetching Atom…`);
+// ---- Poll ----
+async function poll() {
   try {
-    const item = await fetchLatestUpdate();
+    const item = await fetchLatestNews();
     if (!item) {
-      console.log("No CS2 update found.");
+      console.log("No news item.");
+      return;
+    }
+    if (item.gid === lastGid) {
+      console.log("No new update (same gid).");
       return;
     }
 
-    const isNew = item.sourceLink && item.sourceLink !== lastLink;
-    if (isNew || FORCE_POST_ON_BOOT) {
-      const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
-      const parts = chunksWithHeader(header, item.text);
-      for (const p of parts) {
-        await post(p);
-        await sleep(600);
-      }
-      if (item.sourceLink) {
-        await post(item.sourceLink, { suppressEmbeds: true });
-        await sleep(400);
-      }
-      await post(item.finnishLanding, { suppressEmbeds: true });
+    lastGid = item.gid;
 
-      lastLink = item.sourceLink;
-      console.log("Posted update from:", item.sourceLink);
-    } else {
-      console.log("No new update (same link).");
+    const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
+    const body = transformSteamToDiscord(item.contents || "");
+    const out = chunksWithHeader(header, body);
+
+    for (const msg of out) {
+      await post(msg);
+      await sleep(600); // gentle pacing
     }
+
+    // Always drop the source link (embed suppressed)
+    if (item.url) {
+      await post(`<${item.url}>`); // angled brackets suppress embed
+    }
+
+    console.log("Posted update:", item.title || item.gid);
   } catch (e) {
-    console.error("Process error:", e);
+    console.error("Poll error:", e);
   }
 }
 
@@ -188,5 +151,5 @@ if (!TOKEN || !CHANNEL_ID) {
   process.exit(1);
 }
 
-await processOnce("startup");
-setInterval(() => processOnce("poll"), POLL_MS);
+await poll();
+setInterval(poll, POLL_MS);
