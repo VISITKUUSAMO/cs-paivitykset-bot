@@ -1,5 +1,5 @@
-// CS Suomi — CS2 patch notes bot (Finnish from counter-strike.net)
-// Posts plain text; splits for 2000-char limit; robust link extraction + logging.
+// CS Suomi — CS2 patch notes bot (Finnish via official blog RSS)
+// Posts plain text; splits for 2000-char; robust logging.
 //
 // Env vars (Render):
 //   BOT_TOKEN              -> Discord bot token
@@ -19,14 +19,15 @@ import fetch from "node-fetch";
 const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const FORCE_POST_ON_BOOT = (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() === "true";
+
 const CUSTOM_EMOJI = "<:cssuomi:1410389173512310955>";
 const POLL_MS = 5 * 60 * 1000;
 
-const LIST_URL = "https://www.counter-strike.net/news/updates?l=finnish";
-const BASE = "https://www.counter-strike.net";
+// Official Counter-Strike blog RSS (Finnish)
+const RSS_URL = "https://blog.counter-strike.net/index.php/feed/?l=finnish";
 
-// keep last posted URL (in-memory)
-let lastUrl = null;
+// keep last posted link (in-memory)
+let lastLink = null;
 
 // ---- Discord post ----
 async function post(content) {
@@ -46,14 +47,25 @@ async function post(content) {
 
 // ---- Helpers ----
 
-// Convert HTML from the update page to readable Discord text
+// Super-light XML extractors (good enough for RSS)
+function firstMatch(re, text) {
+  const m = re.exec(text);
+  return m ? m[1] : null;
+}
+
+function findAll(re, text) {
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) !== null) out.push(m[1]);
+  return out;
+}
+
+// Clean HTML from RSS content into Discord-friendly text
 function htmlToText(html) {
-  let s = html.replace(/\r/g, "");
+  let s = (html || "").replace(/\r/g, "");
 
-  // Breaks
+  // Line breaks and list items
   s = s.replace(/<\s*br\s*\/?>/gi, "\n");
-
-  // LI -> bullets
   s = s.replace(/<\s*li[^>]*>/gi, "• ");
   s = s.replace(/<\/\s*li\s*>/gi, "\n");
 
@@ -90,7 +102,7 @@ function htmlToText(html) {
   return s.trim();
 }
 
-// First message includes header, then chunk body across multiple messages if needed
+// First message includes header, then chunk body if needed
 function chunksWithHeader(headerLine, body) {
   const LIMIT = 2000;
   const header = `${headerLine}\n\n`;
@@ -110,90 +122,62 @@ function chunksWithHeader(headerLine, body) {
   return chunks;
 }
 
-// Fetch listing page and extract latest update URL (robust)
-async function fetchLatestUpdateUrl() {
-  const r = await fetch(LIST_URL, { headers: { "User-Agent": "cs-suomi-bot/1.1" } });
-  if (!r.ok) throw new Error("List request failed: " + r.status);
-  const html = await r.text();
+// Fetch and parse the RSS feed, return the latest "updates" item
+async function fetchLatestRssItem() {
+  const r = await fetch(RSS_URL, { headers: { "User-Agent": "cs-suomi-bot/2.0" } });
+  if (!r.ok) throw new Error("RSS request failed: " + r.status);
+  const xml = await r.text();
 
-  // Grab all hrefs that look like /news/updates/<slug> (with ' or " quotes)
-  const links = [];
-  const re = /href\s*=\s*['"]([^'"]*\/news\/updates\/[^'"]+)['"]/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    let href = m[1];
+  // Split items
+  const itemBlocks = findAll(/<item>([\s\S]*?)<\/item>/gi, xml);
+  console.log(`RSS items found: ${itemBlocks.length}`);
 
-    // Ensure finnish param
-    if (!/[?&]l=finnish\b/i.test(href)) {
-      href += (href.includes("?") ? "&" : "?") + "l=finnish";
+  // Choose the first item whose link looks like an update (safer),
+  // otherwise just take the very first item.
+  let chosen = null;
+  for (const it of itemBlocks) {
+    const link = firstMatch(/<link>([\s\S]*?)<\/link>/i, it) || "";
+    if (/\/updates\//i.test(link) || /updates/i.test(it)) {
+      chosen = it;
+      break;
     }
-    // Build absolute URL if needed
-    const url = href.startsWith("http") ? href : BASE + href;
-
-    links.push(url);
   }
+  if (!chosen && itemBlocks.length) chosen = itemBlocks[0];
+  if (!chosen) return null;
 
-  console.log("Found update links:", links.slice(0, 5)); // log a few candidates
+  const link = firstMatch(/<link>([\s\S]*?)<\/link>/i, chosen)?.trim() || null;
+  const title = firstMatch(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>|<title>([\s\S]*?)<\/title>/i, chosen) || "CS Päivitys";
 
-  // Return the first candidate (the page usually lists newest first)
-  return links.length ? links[0] : null;
+  // Prefer <content:encoded>, else <description>
+  const encoded = firstMatch(/<content:encoded><!\[CDATA\[([\s\S]*?)\]\]><\/content:encoded>/i, chosen);
+  const desc = firstMatch(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>|<description>([\s\S]*?)<\/description>/i, chosen);
+  const html = encoded || desc || "";
+
+  const text = htmlToText(html);
+  console.log("Chosen title:", (Array.isArray(title) ? title.find(Boolean) : title), " | link:", link, " | textLen:", text.length);
+
+  return { link, title: Array.isArray(title) ? title.find(Boolean) : title, text };
 }
 
-// Fetch the update page and extract main patch notes content
-async function fetchUpdateBodyText(updateUrl) {
-  const r = await fetch(updateUrl, { headers: { "User-Agent": "cs-suomi-bot/1.1" } });
-  if (!r.ok) throw new Error("Update request failed: " + r.status);
-  const html = await r.text();
-
-  // Prefer a known patch container; fall back to body content
-  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  const bodyHtml = bodyMatch ? bodyMatch[1] : html;
-
-  const candidates = [
-    /<div[^>]+class="[^"]*patchnotes[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-    /<div[^>]+id="patchnotes"[^>]*>([\s\S]*?)<\/div>/i,
-    /<article[^>]*>([\s\S]*?)<\/article>/i
-  ];
-
-  let content = "";
-  for (const re of candidates) {
-    const mm = bodyHtml.match(re);
-    if (mm && mm[1]) { content = mm[1]; break; }
-  }
-  if (!content) content = bodyHtml;
-
-  const text = htmlToText(content);
-  console.log(`Fetched update text length: ${text.length}`);
-  return text;
-}
-
-// ---- Poll loop ----
 async function processOnce(reason = "poll") {
   try {
-    console.log(`[${reason}] Fetching latest URL…`);
-    const url = await fetchLatestUpdateUrl();
-    console.log("Latest URL:", url);
+    console.log(`[${reason}] Fetching RSS…`);
+    const item = await fetchLatestRssItem();
+    if (!item) {
+      console.log("No RSS item parsed.");
+      return;
+    }
 
-    if (!url) return;
-
-    const isNew = (url !== lastUrl);
+    const isNew = (item.link && item.link !== lastLink);
     if (isNew || FORCE_POST_ON_BOOT) {
-      console.log(`New or forced post. lastUrl=${lastUrl} next=${url}`);
-      const text = await fetchUpdateBodyText(url);
-      if (!text || text.trim().length < 10) {
-        console.warn("Update text seems empty/short; skipping post.");
-        lastUrl = url; // avoid spinning on a bad page
-        return;
-      }
-
       const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
-      const out = chunksWithHeader(header, text);
+      const out = chunksWithHeader(header, item.text);
       for (const msg of out) await post(msg);
 
-      lastUrl = url;
-      console.log("Posted update from:", url);
+      lastLink = item.link || lastLink; // avoid reposts
+      console.log("Posted update from RSS link:", item.link || "(no link)");
     } else {
-      console.log("No new update.");
+      console.log("No new update (same link).");
     }
   } catch (e) {
     console.error("Process error:", e);
@@ -208,6 +192,8 @@ if (!TOKEN || !CHANNEL_ID) {
   process.exit(1);
 }
 
-await post(`${CUSTOM_EMOJI}  CS Suomi bot on käynnissä ✅ (FI source: counter-strike.net)`);
+await post(`${CUSTOM_EMOJI}  CS Suomi bot on käynnissä ✅ (lähde: blog.counter-strike.net FI RSS)`);
+
+// Force one post on boot if requested
 await processOnce("startup");
 setInterval(poll, POLL_MS);
