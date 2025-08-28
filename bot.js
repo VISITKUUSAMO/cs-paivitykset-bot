@@ -1,6 +1,6 @@
 // CS Suomi — CS2 patch notes bot
 // Posts latest CS2 patch notes in English from Steam News API.
-// Avoids duplicate posts by persisting last posted URL (stable vs gid).
+// Dedupes using normalized URL (stable vs Steam's inconsistent gid/url variants).
 //
 // Env vars:
 //   BOT_TOKEN  -> Discord bot token
@@ -26,10 +26,10 @@ const POLL_MS = 5 * 60 * 1000; // every 5 minutes
 const FEED_URL =
   "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=730&count=1&maxlength=0&l=english";
 
-// File to persist last posted URL
+// File to persist last posted normalized URL
 const STATE_FILE = "last_url.txt";
 
-// Last posted URL (loaded from file if exists)
+// ---- State ----
 let lastUrl = null;
 if (fs.existsSync(STATE_FILE)) {
   try {
@@ -40,7 +40,7 @@ if (fs.existsSync(STATE_FILE)) {
   }
 }
 
-// ---- Discord post helper ----
+// ---- Helpers ----
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function post(content) {
@@ -71,7 +71,27 @@ async function post(content) {
   }
 }
 
-// ---- Text cleanup ----
+// Normalize Steam URLs (remove variants, queries, etc.)
+function normalizeUrl(url) {
+  if (!url) return null;
+  let u = url.trim().toLowerCase();
+
+  // Force https
+  u = u.replace(/^http:\/\//, "https://");
+
+  // Convert CDN prefix to canonical domain
+  u = u.replace("steamstore-a.akamaihd.net", "store.steampowered.com");
+
+  // Remove trailing slash
+  u = u.replace(/\/$/, "");
+
+  // Remove query parameters
+  u = u.split("?")[0];
+
+  return u;
+}
+
+// Transform Steam BBCode-like markup into Discord markdown
 function transformSteamToDiscord(raw) {
   let s = (raw || "").replace(/\r/g, "");
 
@@ -99,7 +119,7 @@ function transformSteamToDiscord(raw) {
   return s.trim();
 }
 
-// Split into safe chunks for Discord
+// Split into safe chunks for Discord (2000 char limit)
 function chunksWithHeader(headerLine, body) {
   const LIMIT = 2000;
   const header = `${headerLine}\n\n`;
@@ -119,7 +139,7 @@ function chunksWithHeader(headerLine, body) {
 
 // ---- Fetch latest news item ----
 async function fetchLatestNews() {
-  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.3" } });
+  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.4" } });
   if (!r.ok) throw new Error(`Feed request failed: ${r.status}`);
   const j = await r.json();
   return j?.appnews?.newsitems?.[0] || null;
@@ -139,13 +159,15 @@ async function poll() {
       return;
     }
 
-    if (item.url === lastUrl) {
-      console.log("No new update (same URL).");
+    const normalized = normalizeUrl(item.url);
+
+    if (normalized === lastUrl) {
+      console.log("No new update (same normalized URL).");
       return;
     }
 
     // Mark as posted *before* sending messages
-    lastUrl = item.url;
+    lastUrl = normalized;
     try {
       fs.writeFileSync(STATE_FILE, lastUrl, "utf8");
     } catch (e) {
