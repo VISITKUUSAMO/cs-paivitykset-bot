@@ -119,7 +119,7 @@ function chunksWithHeader(headerLine, body) {
 
 // ---- Fetch latest news item ----
 async function fetchLatestNews() {
-  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.1" } });
+  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.2" } });
   if (!r.ok) throw new Error(`Feed request failed: ${r.status}`);
   const j = await r.json();
   return j?.appnews?.newsitems?.[0] || null;
@@ -139,7 +139,7 @@ async function poll() {
       return;
     }
 
-    // Mark as posted and persist to file
+    // Mark as posted *before* sending messages
     lastGid = item.gid;
     try {
       fs.writeFileSync(STATE_FILE, lastGid, "utf8");
@@ -173,5 +173,8 @@ if (!TOKEN || !CHANNEL_ID) {
   process.exit(1);
 }
 
+// Run once immediately
 await poll();
-setInterval(poll, POLL_MS);
+
+// Start repeating interval only after first delay
+setTimeout(() => setInterval(poll, POLL_MS), POLL_MS);
