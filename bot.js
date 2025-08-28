@@ -1,59 +1,73 @@
-// CS Suomi — CS2 patch notes bot
-// Posts English body (from Steam Store News RSS) + links (source + Finnish updates page).
-// No startup message; embeds suppressed for links; gentle filtering to prefer patch notes.
+// CS Suomi — CS2 patch notes bot (English body + Finnish link)
+// Fixes:
+//  - Strict CS2 filtering (/app/730/ or counter-strike.net)
+//  - HTML entity unescape before cleaning (Steam RSS ships escaped HTML)
+//  - Basic handling for Steam bb_* blocks
+//  - Discord 429 retry + pacing between messages
 //
-// Env vars (Render):
-//   BOT_TOKEN              -> Discord bot token
-//   CHANNEL_ID             -> target channel ID
-//   FORCE_POST_ON_BOOT     -> "true" to force-post latest once on startup (optional)
+// Env vars:
+//   BOT_TOKEN
+//   CHANNEL_ID
+//   FORCE_POST_ON_BOOT ("true" to force-post latest once on startup; optional)
 //
 // package.json:
-// {
-//   "type": "module",
-//   "scripts": { "start": "node bot.js" },
-//   "dependencies": { "node-fetch": "^3.3.2" }
-// }
+// { "type": "module", "scripts": { "start": "node bot.js" }, "dependencies": { "node-fetch": "^3.3.2" } }
 
 import fetch from "node-fetch";
 
 // ---- CONFIG ----
 const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const FORCE_POST_ON_BOOT =
-  (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() === "true";
+const FORCE_POST_ON_BOOT = (process.env.FORCE_POST_ON_BOOT || "").toLowerCase() === "true";
 
 const CUSTOM_EMOJI = "<:cssuomi:1410389173512310955>";
 const POLL_MS = 5 * 60 * 1000; // 5 min
 
-// Steam Store News RSS for app 730 (CS2). `l=finnish` mainly localizes UI on the Steam site.
-const RSS_URL =
-  "https://store.steampowered.com/feeds/news/?appids=730&l=finnish";
+// Steam Store News RSS for CS2
+const RSS_URL = "https://store.steampowered.com/feeds/news/?appids=730&l=finnish";
 
-// Keep last posted link (in-memory)
+// Remember last posted link (in-memory)
 let lastLink = null;
 
-// ---- Discord helpers ----
-async function post(content, { suppressEmbeds = false } = {}) {
+// ---- Helpers ----
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function post(content, { suppressEmbeds = false, attempts = 3 } = {}) {
   if (!content) return;
-  const payload = suppressEmbeds ? { content, flags: 4 } : { content }; // 4 = SUPPRESS_EMBEDS
-  const res = await fetch(
-    `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`,
-    {
+  const payload = suppressEmbeds ? { content, flags: 4 } : { content };
+
+  for (let i = 0; i < attempts; i++) {
+    const res = await fetch(`https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`, {
       method: "POST",
       headers: {
         Authorization: `Bot ${TOKEN}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
-    }
-  );
-  if (!res.ok) {
+    });
+
+    if (res.ok) return;
     const txt = await res.text().catch(() => "");
+    if (res.status === 429) {
+      // Respect rate limit and retry
+      try {
+        const data = JSON.parse(txt);
+        const wait = Math.ceil((data.retry_after || 0.5) * 1000);
+        console.warn("Rate limited, waiting", wait, "ms");
+        await sleep(wait);
+        continue;
+      } catch {
+        await sleep(800);
+        continue;
+      }
+    }
     console.error("Post failed:", res.status, txt);
+    // For non-429 errors, do not retry aggressively
+    break;
   }
 }
 
-// ---- Utility: lightweight XML parsing ----
+// Lightweight XML helpers
 function firstMatch(re, text) {
   const m = re.exec(text);
   return m ? (m[1] || m[2]) : null;
@@ -65,9 +79,34 @@ function findAll(re, text) {
   return out;
 }
 
-// ---- HTML -> text ----
-function htmlToText(html) {
-  let s = (html || "").replace(/\r/g, "");
+// Decode HTML entities (&lt; &gt; &amp; &quot; &#39; and numeric)
+function htmlDecode(input) {
+  if (!input) return "";
+  let s = input
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  // numeric entities
+  s = s.replace(/&#(\d+);/g, (_, num) => String.fromCharCode(parseInt(num, 10)));
+  s = s.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  return s;
+}
+
+// HTML -> text with Steam bb_* awareness
+function htmlToText(htmlRaw) {
+  // Step 1: unescape if escaped
+  let html = htmlDecode(htmlRaw || "");
+
+  // Normalize Steam bb_* block classes to semantic tags
+  // <div class="bb_h2"> -> <h2> ... </h2>
+  html = html.replace(/<\s*div\s+class=["']bb_h2["'][^>]*>([\s\S]*?)<\/\s*div\s*>/gi, "<h2>$1</h2>");
+  // Lists already come as <ul class="bb_ul"> with <li>, fine.
+
+  // Now standard cleaning
+  let s = html.replace(/\r/g, "");
 
   // line breaks & list items
   s = s.replace(/<\s*br\s*\/?>/gi, "\n");
@@ -80,9 +119,11 @@ function htmlToText(html) {
     return clean ? `\n[ ${clean} ]\n` : "\n";
   });
 
-  // paragraphs
+  // paragraphs/divs as breaks
   s = s.replace(/<\s*p[^>]*>/gi, "\n");
   s = s.replace(/<\/\s*p\s*>/gi, "\n");
+  s = s.replace(/<\s*div[^>]*>/gi, "\n");
+  s = s.replace(/<\/\s*div\s*>/gi, "\n");
 
   // bold/italic
   s = s.replace(/<\s*strong[^>]*>([\s\S]*?)<\/\s*strong\s*>/gi, "**$1**");
@@ -99,13 +140,14 @@ function htmlToText(html) {
   s = s.replace(/<\s*style[\s\S]*?<\/\s*style\s*>/gi, "");
   s = s.replace(/<[^>]+>/g, "");
 
-  // collapse extra blank lines
+  // collapse whitespace
+  s = s.replace(/[ \t]+\n/g, "\n");
   s = s.replace(/\n{3,}/g, "\n\n");
 
   return s.trim();
 }
 
-// First message includes header; subsequent messages are body chunks
+// First message includes header; subsequent are body chunks
 function chunksWithHeader(headerLine, body) {
   const LIMIT = 2000;
   const header = `${headerLine}\n\n`;
@@ -113,32 +155,35 @@ function chunksWithHeader(headerLine, body) {
 
   if ((header + body).length <= LIMIT) {
     chunks.push(header + body);
-    return chunks;
-  }
-
-  const firstRoom = LIMIT - header.length;
-  chunks.push(header + body.slice(0, firstRoom));
-
-  for (let i = firstRoom; i < body.length; i += 1900) {
-    chunks.push(body.slice(i, i + 1900));
+  } else {
+    const firstRoom = LIMIT - header.length;
+    chunks.push(header + body.slice(0, firstRoom));
+    for (let i = firstRoom; i < body.length; i += 1800) {
+      chunks.push(body.slice(i, i + 1800));
+    }
   }
   return chunks;
 }
 
-// ---- Patch-notes heuristics ----
-function looksLikePatchNotes(title, link) {
-  const t = (title || "").toLowerCase();
+// Identify CS2 patch notes and ensure it's really CS2
+function isCs2Link(link) {
   const l = (link || "").toLowerCase();
   return (
-    /update|release notes|patch|client update/i.test(t) ||
-    /\/news\/updates\//.test(l) || // counter-strike.net
-    /store\.steampowered\.com\/news\/app\/730\/view\//.test(l) // Steam News for CS2
+    /counter-strike\.net\/news\/updates\//.test(l) ||
+    /store\.steampowered\.com\/news\/app\/730\/view\//.test(l)
+  );
+}
+function looksLikePatchNotes(title, link) {
+  const t = (title || "").toLowerCase();
+  return (
+    isCs2Link(link) &&
+    (/update|release notes|patch|client update/i.test(title || "") || /updates\//i.test(link || ""))
   );
 }
 
-// ---- Core: fetch & pick the latest likely patch-notes item ----
+// ---- RSS fetch & select latest CS2 update ----
 async function fetchLatestUpdateItem() {
-  const r = await fetch(RSS_URL, { headers: { "User-Agent": "cs-suomi-bot/3.3" } });
+  const r = await fetch(RSS_URL, { headers: { "User-Agent": "cs-suomi-bot/3.4" } });
   if (!r.ok) throw new Error("RSS request failed: " + r.status);
   const xml = await r.text();
 
@@ -152,7 +197,8 @@ async function fetchLatestUpdateItem() {
   for (const it of itemBlocks) {
     const link =
       firstMatch(/<link><!\[CDATA\[([\s\S]*?)\]\]><\/link>/i, it) ||
-      firstMatch(/<link>([\s\S]*?)<\/link>/i, it);
+      firstMatch(/<link>([\s\S]*?)<\/link>/i, it) ||
+      "";
     const title =
       firstMatch(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i, it) ||
       firstMatch(/<title>([\s\S]*?)<\/title>/i, it) ||
@@ -160,45 +206,28 @@ async function fetchLatestUpdateItem() {
 
     if (looksLikePatchNotes(title, link)) {
       best = it;
-      bestLink = (link || "").trim();
+      bestLink = link.trim();
       bestTitle = title.trim();
       break;
     }
   }
 
-  // Fallback: take newest if none matched heuristics
-  if (!best && itemBlocks.length) {
-    best = itemBlocks[0];
-    bestLink =
-      (firstMatch(/<link><!\[CDATA\[([\s\S]*?)\]\]><\/link>/i, best) ||
-        firstMatch(/<link>([\s\S]*?)<\/link>/i, best) ||
-        "").trim();
-    bestTitle =
-      firstMatch(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i, best) ||
-      firstMatch(/<title>([\s\S]*?)<\/title>/i, best) ||
-      "CS Update";
+  if (!best) {
+    console.log("No CS2 update item matched. Skipping.");
+    return null;
   }
 
-  if (!best) return null;
-
   // Body: prefer <content:encoded>, else <description>
-  const encoded = firstMatch(
-    /<content:encoded><!\[CDATA\[([\s\S]*?)\]\]><\/content:encoded>/i,
-    best
-  );
+  const encoded = firstMatch(/<content:encoded><!\[CDATA\[([\s\S]*?)\]\]><\/content:encoded>/i, best);
   const desc =
     firstMatch(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/i, best) ||
     firstMatch(/<description>([\s\S]*?)<\/description>/i, best);
 
-  const html = encoded || desc || "";
-  const text = htmlToText(html);
+  const rawHtml = encoded || desc || "";
+  const text = htmlToText(rawHtml);
 
-  // Source link we discovered from RSS
   const sourceLink = bestLink;
-
-  // A Finnish landing page to share as well
-  const finnishUpdatesLanding =
-    "https://www.counter-strike.net/news/updates?l=finnish";
+  const finnishUpdatesLanding = "https://www.counter-strike.net/news/updates?l=finnish";
 
   return { title: bestTitle, text, sourceLink, finnishUpdatesLanding };
 }
@@ -208,20 +237,26 @@ async function processOnce(reason = "poll") {
     console.log(`[${reason}] Fetching RSS…`);
     const item = await fetchLatestUpdateItem();
     if (!item) {
-      console.log("No suitable RSS item parsed.");
+      console.log("No suitable CS2 update found.");
       return;
     }
 
     const isNew = item.sourceLink && item.sourceLink !== lastLink;
     if (isNew || FORCE_POST_ON_BOOT) {
       const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
+      const body = item.text || "Patch notes available at the links below.";
 
-      // English body, Finnish header
-      const parts = chunksWithHeader(header, item.text || "Patch notes available at the links below.");
-      for (const p of parts) await post(p);
+      const parts = chunksWithHeader(header, body);
+      for (const p of parts) {
+        await post(p);
+        await sleep(600); // pace messages to avoid 429
+      }
 
-      // 1) Original source link (embed suppressed)
-      if (item.sourceLink) await post(item.sourceLink, { suppressEmbeds: true });
+      // 1) Original source (embed suppressed)
+      if (item.sourceLink) {
+        await post(item.sourceLink, { suppressEmbeds: true });
+        await sleep(400);
+      }
 
       // 2) Finnish updates landing (embed suppressed)
       await post(item.finnishUpdatesLanding, { suppressEmbeds: true });
