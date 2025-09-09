@@ -111,36 +111,50 @@ function normalizeUrl(url) {
   return u;
 }
 
-// BBCode -> Discord markdown
+// BBCode -> Discord markdown (Steam-flavored)
 function transformSteamToDiscord(raw) {
   let s = (raw || "").replace(/\r/g, "");
 
   // Remove images
   s = s.replace(/\[img\][\s\S]*?\[\/img\]/gi, "");
 
-  // [url=...]text[/url] -> text
-  s = s.replace(/\[url=[^\]]+\]([\s\S]*?)\[\/url\]/gi, "$1");
+  // URLs
+  // [url=link]text[/url]  ->  text (link)
+  s = s.replace(/\[url=([^\]]+)\]([\s\S]*?)\[\/url\]/gi, "$2 ($1)");
+  // [url]link[/url]       ->  link
+  s = s.replace(/\[url\]([\s\S]*?)\[\/url\]/gi, "$1");
+
+  // Headings -> bold line
+  s = s.replace(/\[(h[1-6])\]([\s\S]*?)\[\/\1\]/gi, "**$2**\n");
+
+  // Paragraphs: open tag = nothing, close tag = newline
+  s = s.replace(/\[p\]\s*/gi, "");
+  s = s.replace(/\s*\[\/p\]\s*/gi, "\n");
+
+  // Lists
+  s = s.replace(/\[\/?list(?:=[^\]]+)?\]/gi, "");   // drop wrappers
+  s = s.replace(/\s*\[\*\]\s*/gi, "\n• ");          // bullets
+
+  // Quotes / code / strikethrough
+  s = s.replace(/\[quote\]([\s\S]*?)\[\/quote\]/gi, "> $1");
+  s = s.replace(/\[code\]([\s\S]*?)\[\/code\]/gi, "`$1`");
+  s = s.replace(/\[strike\]([\s\S]*?)\[\/strike\]/gi, "~~$1~~");
 
   // Basic formatting
   s = s.replace(/\[b\]([\s\S]*?)\[\/b\]/gi, "**$1**");
   s = s.replace(/\[i\]([\s\S]*?)\[\/i\]/gi, "*$1*");
   s = s.replace(/\[u\]([\s\S]*?)\[\/u\]/gi, "__$1__");
 
-  // Kill odd BBCode closers some Steam posts include
+  // Kill odd closers Steam sometimes emits
   s = s.replace(/\[\/\]|\[\/\*\]/g, "");
 
-  // Remove [list] wrappers
-  s = s.replace(/\[\/?list(?:=[^\]]+)?\]/gi, "");
-
-  // Ensure each bullet item starts on a new line
-  // (any amount of whitespace before [*] becomes a single newline)
-  s = s.replace(/\s*\[\*\]\s*/gi, "\n• ");
-
-  // Tidy whitespace
-  s = s.replace(/^\n+/, "");     // leading newlines
+  // Whitespace tidy
+  s = s.replace(/[ \t]+\n/g, "\n"); // strip trailing spaces
   s = s.replace(/\n{3,}/g, "\n\n"); // collapse 3+ to 2
+  s = s.replace(/^\n+/, "");        // leading newlines
+  s = s.trim();
 
-  return s.trim();
+  return s;
 }
 
 // Discord chunking
