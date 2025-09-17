@@ -119,21 +119,22 @@ function transformSteamToDiscord(raw) {
   s = s.replace(/\[img\][\s\S]*?\[\/img\]/gi, "");
 
   // URLs
-  // [url=link]text[/url]  ->  text (link)
   s = s.replace(/\[url=([^\]]+)\]([\s\S]*?)\[\/url\]/gi, "$2 ($1)");
-  // [url]link[/url]       ->  link
   s = s.replace(/\[url\]([\s\S]*?)\[\/url\]/gi, "$1");
 
-  // Headings -> bold line
-  s = s.replace(/\[(h[1-6])\]([\s\S]*?)\[\/\1\]/gi, "**$2**\n");
+  // Headings -> [TITLE] on its own line (no spaces inside brackets)
+  s = s.replace(/\[(h[1-6])\]([\s\S]*?)\[\/\1\]/gi, (_, __, text) => {
+    const t = String(text).replace(/\s+/g, " ").trim();
+    return `[${t}]\n`;
+  });
 
   // Paragraphs: open tag = nothing, close tag = newline
   s = s.replace(/\[p\]\s*/gi, "");
   s = s.replace(/\s*\[\/p\]\s*/gi, "\n");
 
-  // Lists
-  s = s.replace(/\[\/?list(?:=[^\]]+)?\]/gi, "");   // drop wrappers
-  s = s.replace(/\s*\[\*\]\s*/gi, "\n• ");          // bullets
+  // Lists: drop wrappers, render [*] as "* " bullets (one newline per item)
+  s = s.replace(/\[\/?list(?:=[^\]]+)?\]/gi, "");
+  s = s.replace(/\s*\[\*\]\s*/gi, "\n* ");
 
   // Quotes / code / strikethrough
   s = s.replace(/\[quote\]([\s\S]*?)\[\/quote\]/gi, "> $1");
@@ -149,9 +150,9 @@ function transformSteamToDiscord(raw) {
   s = s.replace(/\[\/\]|\[\/\*\]/g, "");
 
   // Whitespace tidy
-  s = s.replace(/[ \t]+\n/g, "\n"); // strip trailing spaces
-  s = s.replace(/\n{3,}/g, "\n\n"); // collapse 3+ to 2
-  s = s.replace(/^\n+/, "");        // leading newlines
+  s = s.replace(/[ \t]+\n/g, "\n");   // strip trailing spaces before newline
+  s = s.replace(/\n{3,}/g, "\n\n");   // collapse 3+ to 2
+  s = s.replace(/^\n+/, "");          // leading newlines
   s = s.trim();
 
   return s;
