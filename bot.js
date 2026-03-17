@@ -1,19 +1,3 @@
-// CS Suomi — CS2 patch notes bot
-// English-only CS2 patch notes from Steam News API (appid 730).
-// De-duplicates using a stable announcement ID parsed from the URL,
-// and checks only the last 3 messages from THIS BOT in the channel.
-//
-// Env vars:
-//   BOT_TOKEN  -> Discord bot token
-//   CHANNEL_ID -> target channel ID
-//
-// package.json:
-// {
-//   "type": "module",
-//   "scripts": { "start": "node bot.js" },
-//   "dependencies": { "node-fetch": "^3.3.2" }
-// }
-
 import fetch from "node-fetch";
 import fs from "fs";
 
@@ -26,27 +10,39 @@ const POLL_MS = 5 * 60 * 1000; // 5 minutes
 const FEED_URL =
   "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=730&count=1&maxlength=0&l=english";
 
-// Persist last posted key (announcement ID or normalized URL)
-const STATE_FILE = "last_key.txt";
+const STATE_FILE = "last_gid.txt";
 
-// ---- STATE ----
-let lastKey = null;
-let botUserId = null;
-
-if (fs.existsSync(STATE_FILE)) {
-  try {
-    lastKey = fs.readFileSync(STATE_FILE, "utf8").trim() || null;
-    console.log("Loaded lastKey:", lastKey);
-  } catch (e) {
-    console.warn("Could not read state:", e);
-  }
+// ---- STARTUP CHECK ----
+if (!TOKEN || !CHANNEL_ID) {
+  console.error("Missing BOT_TOKEN or CHANNEL_ID");
+  process.exit(1);
 }
 
 // ---- HELPERS ----
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function loadLastGid() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      return fs.readFileSync(STATE_FILE, "utf8").trim() || null;
+    }
+  } catch (err) {
+    console.warn("Could not read state file:", err);
+  }
+  return null;
+}
+
+function saveLastGid(gid) {
+  try {
+    fs.writeFileSync(STATE_FILE, String(gid), "utf8");
+  } catch (err) {
+    console.warn("Could not write state file:", err);
+  }
+}
 
 async function post(content) {
   if (!content) return;
+
   while (true) {
     const res = await fetch(`https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`, {
       method: "POST",
@@ -54,9 +50,14 @@ async function post(content) {
         Authorization: `Bot ${TOKEN}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({
+        content,
+        flags: 4
+      }),
     });
+
     if (res.ok) return;
+
     if (res.status === 429) {
       const data = await res.json().catch(() => ({}));
       const wait = Math.ceil((data.retry_after || 0.5) * 1000);
@@ -64,178 +65,81 @@ async function post(content) {
       await sleep(wait);
       continue;
     }
+
     const txt = await res.text().catch(() => "");
-    console.error("Post failed:", res.status, txt);
-    break;
+    throw new Error(`Post failed: ${res.status} ${txt}`);
   }
 }
 
-// Bot identity (to filter messages by author)
-async function ensureBotUserId() {
-  if (botUserId) return botUserId;
-  const res = await fetch("https://discord.com/api/v10/users/@me", {
-    headers: { Authorization: `Bot ${TOKEN}` },
-  });
-  if (!res.ok) throw new Error("Failed to fetch bot user: " + res.status);
-  const me = await res.json();
-  botUserId = me.id;
-  return botUserId;
+function cleanTitle(title) {
+  if (!title) return "CS2 Update";
+  return String(title).replace(/\s+/g, " ").trim();
 }
 
-// Get last N messages authored by THIS bot (scan up to ~50 recent)
-async function fetchLastBotMessages(n = 3) {
-  await ensureBotUserId();
-  const res = await fetch(
-    `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages?limit=50`,
-    { headers: { Authorization: `Bot ${TOKEN}` } }
-  );
-  if (!res.ok) return [];
-  const msgs = await res.json().catch(() => []);
-  return msgs.filter((m) => m?.author?.id === botUserId).slice(0, n);
-}
-
-// Extract stable announcement ID from Steam URL
-function extractAnnouncementId(url) {
+function cleanUrl(url) {
   if (!url) return null;
-  const m = String(url).match(/(\d{9,})$/); // long numeric id at end
-  return m ? m[1] : null;
+  return String(url).trim();
 }
 
-// Fallback normalization if ID cannot be extracted (rare)
-function normalizeUrl(url) {
-  if (!url) return null;
-  let u = url.trim().toLowerCase();
-  u = u.replace(/^http:\/\//, "https://");
-  u = u.replace("steamstore-a.akamaihd.net", "store.steampowered.com");
-  u = u.split("?")[0].replace(/\/$/, "");
-  return u;
-}
-
-// BBCode -> Discord markdown (Steam-flavored)
-function transformSteamToDiscord(raw) {
-  let s = (raw || "").replace(/\r/g, "");
-
-  // Remove images
-  s = s.replace(/\[img\][\s\S]*?\[\/img\]/gi, "");
-
-  // URLs
-  s = s.replace(/\[url=([^\]]+)\]([\s\S]*?)\[\/url\]/gi, "$2 ($1)");
-  s = s.replace(/\[url\]([\s\S]*?)\[\/url\]/gi, "$1");
-
-  // Headings -> [TITLE] on its own line (no spaces inside brackets)
-  s = s.replace(/\[(h[1-6])\]([\s\S]*?)\[\/\1\]/gi, (_, __, text) => {
-    const t = String(text).replace(/\s+/g, " ").trim();
-    return `[${t}]\n`;
-  });
-
-  // Paragraphs: open tag = nothing, close tag = newline
-  s = s.replace(/\[p\]\s*/gi, "");
-  s = s.replace(/\s*\[\/p\]\s*/gi, "\n");
-
-  // Lists: drop wrappers, render [*] as "* " bullets (one newline per item)
-  s = s.replace(/\[\/?list(?:=[^\]]+)?\]/gi, "");
-  s = s.replace(/\s*\[\*\]\s*/gi, "\n* ");
-
-  // Quotes / code / strikethrough
-  s = s.replace(/\[quote\]([\s\S]*?)\[\/quote\]/gi, "> $1");
-  s = s.replace(/\[code\]([\s\S]*?)\[\/code\]/gi, "`$1`");
-  s = s.replace(/\[strike\]([\s\S]*?)\[\/strike\]/gi, "~~$1~~");
-
-  // Basic formatting
-  s = s.replace(/\[b\]([\s\S]*?)\[\/b\]/gi, "**$1**");
-  s = s.replace(/\[i\]([\s\S]*?)\[\/i\]/gi, "*$1*");
-  s = s.replace(/\[u\]([\s\S]*?)\[\/u\]/gi, "__$1__");
-
-  // Kill odd closers Steam sometimes emits
-  s = s.replace(/\[\/\]|\[\/\*\]/g, "");
-
-  // Whitespace tidy
-  s = s.replace(/[ \t]+\n/g, "\n");   // strip trailing spaces before newline
-  s = s.replace(/\n{3,}/g, "\n\n");   // collapse 3+ to 2
-  s = s.replace(/^\n+/, "");          // leading newlines
-  s = s.trim();
-
-  return s;
-}
-
-// Discord chunking
-function chunksWithHeader(headerLine, body) {
-  const LIMIT = 2000;
-  const header = `${headerLine}\n\n`;
-  const out = [];
-  if ((header + body).length <= LIMIT) out.push(header + body);
-  else {
-    const firstRoom = LIMIT - header.length;
-    out.push(header + body.slice(0, firstRoom));
-    for (let i = firstRoom; i < body.length; i += 1800) out.push(body.slice(i, i + 1800));
-  }
-  return out;
-}
-
-// Fetch latest news item from Steam
 async function fetchLatestNews() {
-  const r = await fetch(FEED_URL, { headers: { "User-Agent": "cs-suomi-bot/1.6" } });
-  if (!r.ok) throw new Error(`Feed request failed: ${r.status}`);
-  const j = await r.json();
-  return j?.appnews?.newsitems?.[0] || null;
+  const res = await fetch(FEED_URL, {
+    headers: {
+      "User-Agent": "cs-suomi-bot/2.0"
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error(`Feed request failed: ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data?.appnews?.newsitems?.[0] || null;
 }
 
-// ---- MAIN POLL ----
 async function poll() {
   try {
     const item = await fetchLatestNews();
-    if (!item || !item.url) {
-      console.log("No news item or URL.");
+
+    if (!item) {
+      console.log("No news item found.");
       return;
     }
 
-    const key = extractAnnouncementId(item.url) || normalizeUrl(item.url);
-    if (!key) {
-      console.log("Could not form dedupe key; skipping.");
+    const gid = String(item.gid || "").trim();
+    const title = cleanTitle(item.title);
+    const url = cleanUrl(item.url);
+    const lastGid = loadLastGid();
+
+    console.log("Latest gid:", gid);
+    console.log("Latest title:", title);
+    console.log("Latest url:", url);
+
+    if (!gid) {
+      console.log("Missing gid, skipping.");
       return;
     }
 
-    // Check last 3 messages authored by this bot
-    const recentBotMsgs = await fetchLastBotMessages(3);
-    const alreadyPostedInChannel = recentBotMsgs.some((m) => (m?.content || "").includes(key));
-    if (alreadyPostedInChannel) {
-      // Persist state anyway so restarts also skip
-      try { fs.writeFileSync(STATE_FILE, key, "utf8"); } catch {}
-      console.log("Duplicate detected in last 3 bot messages; skipping.");
+    if (gid === lastGid) {
+      console.log("No new update.");
       return;
     }
 
-    // Check state file too
-    if (key === lastKey) {
-      console.log("No new update (same key).");
-      return;
-    }
+    const message =
+`${CUSTOM_EMOJI} **Uusi CS2-päivitys!**
 
-    // Mark as posted BEFORE sending
-    lastKey = key;
-    try { fs.writeFileSync(STATE_FILE, lastKey, "utf8"); } catch (e) { console.warn("State write failed:", e); }
+**${title}**
 
-    const header = `${CUSTOM_EMOJI}  **Uusi CS2-päivitys!**`;
-    const body = transformSteamToDiscord(item.contents || "");
-    const parts = chunksWithHeader(header, body);
+Patch notes: <${url}>`;
 
-    for (const p of parts) { await post(p); await sleep(600); }
-    await post(`<${item.url}>`); // suppress embed with <...>
+    await post(message);
+    saveLastGid(gid);
 
-    console.log("Posted update:", item.title || item.url);
-  } catch (e) {
-    console.error("Poll error:", e);
+    console.log("Posted update:", gid, title);
+  } catch (err) {
+    console.error("Poll error:", err);
   }
 }
 
 // ---- STARTUP ----
-if (!TOKEN || !CHANNEL_ID) {
-  console.error("Missing BOT_TOKEN or CHANNEL_ID");
-  process.exit(1);
-}
-
-// One immediate poll
 await poll();
-
-// Start repeating interval only after first delay (prevents double at boot)
 setTimeout(() => setInterval(poll, POLL_MS), POLL_MS);
