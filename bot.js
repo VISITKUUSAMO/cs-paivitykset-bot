@@ -78,7 +78,13 @@ function cleanTitle(title) {
 
 function cleanUrl(url) {
   if (!url) return null;
-  return String(url).trim();
+
+  let u = String(url).trim();
+
+  u = u.replace(/^http:\/\//i, "https://");
+  u = u.replace("steamstore-a.akamaihd.net", "store.steampowered.com");
+
+  return u;
 }
 
 async function fetchLatestNews() {
@@ -106,12 +112,10 @@ async function poll() {
     }
 
     const gid = String(item.gid || "").trim();
-    const title = cleanTitle(item.title);
     const url = cleanUrl(item.url);
     const lastGid = loadLastGid();
 
     console.log("Latest gid:", gid);
-    console.log("Latest title:", title);
     console.log("Latest url:", url);
 
     if (!gid) {
@@ -127,9 +131,7 @@ async function poll() {
     const message =
 `${CUSTOM_EMOJI} **Uusi CS2-päivitys!**
 
-**${title}**
-
-Patch notes: <${url}>`;
+Lue lisää Steamista: <${url}>`;
 
     await post(message);
     saveLastGid(gid);
